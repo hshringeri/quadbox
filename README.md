@@ -44,6 +44,41 @@ automatically:
 ./quadbox nfl chiefs eagles  # multiple words narrow the match
 ```
 
+### Example: 4 games, zero link-hunting
+
+```console
+$ ./quadbox nhl
+1   Buffalo Sabres vs Chicago Blackhawks
+2   Columbus Blue Jackets vs Utah Mammoth
+3   Edmonton Oilers vs Seattle Kraken
+4   Philadelphia Flyers vs Carolina Hurricanes
+5   Pittsburgh Penguins vs Montréal Canadiens
+6   Tampa Bay Lightning vs Washington Capitals
+7   Toronto Maple Leafs vs Ottawa Senators
+8   New York Islanders vs New Jersey Devils
+9   Minnesota Wild vs Boston Bruins
+10  Nashville Predators vs Dallas Stars
+11  Colorado Avalanche vs St. Louis Blues
+12  San Jose Sharks vs Los Angeles Kings
+13  Vancouver Canucks vs Calgary Flames
+pick up to 4 numbers (space separated): 1 3 7 9
+launching: Buffalo Sabres vs Chicago Blackhawks
+launching: Edmonton Oilers vs Seattle Kraken
+launching: Toronto Maple Leafs vs Ottawa Senators
+launching: Minnesota Wild vs Boston Bruins
+win1: -> x=0   y=38  735x472  pin=native
+win2: -> x=735 y=38  736x472  pin=native
+win3: -> x=0   y=510 735x472  pin=native
+win4: -> x=735 y=510 736x472  pin=native
+```
+
+Four windows, 2×2, each with its full-bleed player. Click play once per
+window, mute three.
+
+Only know team names? Skip the menu — keywords match the listing and launch
+directly (great for a single game: `./quadbox nhl sabres`). One sport per
+run; for a mixed-sport quad, paste the four links instead.
+
 Sport keys are whatever the site lists that day (`nhl`, `nfl`, `cfb`,
 `mlb-playoffs`, `nba-preseason`, `cfl`, …). Pre-game you get the watch page
 (it goes live there); once live, the command resolves straight to the
