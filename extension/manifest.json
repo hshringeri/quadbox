@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "quadfill",
+  "version": "1.1",
+  "description": "Fills quadbox-sized windows with the page's video player. Only activates in windows narrower than 60% of the screen.",
+  "content_scripts": [
+    {
+      "matches": ["*://*/*"],
+      "all_frames": true,
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

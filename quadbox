@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# quadbox — 1-4 live videos on one screen, each full-bleed in its quadrant.
+#
+#  All-YouTube links -> local quad page (2x2 iframe embeds). No setup at all.
+#  Any other site    -> tiled app-mode windows + quadfill pin, via either:
+#                       a) the bundled Chrome extension (extension/), or
+#                       b) Chrome's "Allow JavaScript from Apple Events".
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT=8787
+
+if [ "${1:-}" = "pin" ]; then
+  MODE="pin"
+else
+  # buffstreams picker: quadbox <sport> [team keywords...]
+  #   quadbox nhl            -> numbered menu of today's NHL games, pick up to 4
+  #   quadbox nhl sabres     -> auto-launch every game matching keywords
+  BUFF="${BUFF_DOMAIN:-https://mybuffstreams.plus}"
+  re_sport='^[a-z0-9-]+$'
+  if [ "$#" -ge 1 ] && [[ $1 =~ $re_sport ]] && ! [[ "$1" == *.* ]]; then
+    SPORT="$1"; shift
+    LISTING=$(python3 - "$BUFF" "$SPORT" "$@" <<'PY'
+import re, sys, html as h, urllib.request
+domain, sport, kw = sys.argv[1], sys.argv[2], [w.lower() for w in sys.argv[3:]]
+try:
+    req = urllib.request.Request(domain + "/", headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"})
+    doc = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
+except Exception as e:
+    sys.exit("fetch failed: %s" % e)
+pat = (r'<a\s+class="competition"\s+title="Buffstreams ([^"]+)"\s+href="('
+       + re.escape(domain) + r'/' + re.escape(sport) + r'/[^"]+)"')
+seen, rows = set(), []
+for m in re.finditer(pat, doc):
+    label, url = h.unescape(m.group(1)).strip(), m.group(2)
+    if url in seen:
+        continue
+    seen.add(url)
+    if kw and not all(w in label.lower() for w in kw):
+        continue
+    rows.append((label, url))
+if not rows:
+    sys.exit("no games found for '%s' today (check sport name; if the site rotated domains, set BUFF_DOMAIN)" % sport)
+for i, (label, url) in enumerate(rows, 1):
+    print("%d\t%s\t%s" % (i, label, url))
+PY
+) || { echo "quadbox: $LISTING" >&2; exit 1; }
+
+    LABELS=(); PICK_URLS=()
+    while IFS=$'\t' read -r _idx label url; do
+      LABELS+=("$label"); PICK_URLS+=("$url")
+    done <<< "$LISTING"
+
+    if [ "$#" -gt 0 ] && [ "${#PICK_URLS[@]}" -le 4 ]; then
+      PICKED=("${PICK_URLS[@]}")            # keyword mode: auto-pick matches
+      PICKED_LABELS=("${LABELS[@]}")
+    else
+      echo "$LISTING" | cut -f1,2 >&2      # numbered menu
+      printf 'pick up to 4 numbers (space separated): ' >&2
+      IFS=' ' read -r picks
+      PICKED=(); PICKED_LABELS=()
+      for p in $picks; do
+        case "$p" in ''|*[!0-9]*) echo "quadbox: '$p' is not a number" >&2; exit 2;; esac
+        [ "$p" -ge 1 ] && [ "$p" -le "${#PICK_URLS[@]}" ] || { echo "quadbox: no game #$p" >&2; exit 2; }
+        PICKED+=("${PICK_URLS[$((p-1))]}")
+        PICKED_LABELS+=("${LABELS[$((p-1))]}")
+        [ "${#PICKED[@]}" -ge 4 ] && break
+      done
+      [ "${#PICKED[@]}" -ge 1 ] || { echo "no games picked" >&2; exit 2; }
+    fi
+    printf 'launching: %s\n' "${PICKED_LABELS[@]}" >&2
+    set -- "${PICKED[@]}"
+  elif [ "$#" -eq 0 ]; then
+    # interactive: paste links one per line (or pipe them in)
+    URLS=()
+    [ -t 0 ] && echo "Paste up to 4 links, one per line (empty line when done):" >&2
+    while [ "${#URLS[@]}" -lt 4 ]; do
+      [ -t 0 ] && printf "link %d: " "$(( ${#URLS[@]} + 1 ))" >&2
+      IFS= read -r line || break
+      line="${line#"${line%%[![:space:]]*}"}"   # trim leading whitespace
+      line="${line%"${line##*[![:space:]]}"}"   # trim trailing whitespace
+      [ -z "$line" ] && break
+      URLS+=("$line")
+    done
+    [ "${#URLS[@]}" -ge 1 ] || { echo "no links given" >&2; exit 2; }
+    set -- "${URLS[@]}"
+  fi
+  if [ "$#" -lt 1 ] || [ "$#" -gt 4 ]; then
+    echo "usage: quadbox [URL] [URL2] [URL3] [URL4]   open videos in a quad layout" >&2
+    echo "       quadbox pin                            re-pin video in small windows (Apple-Events mode)" >&2
+    exit 2
+  fi
+  MODE="tile"
+fi
+
+# Visible work area (excludes menu bar + Dock), converted to top-left coords.
+read -r L T R B < <(osascript -l JavaScript -e '
+function run() {
+  ObjC.import("AppKit");
+  const f = $.NSScreen.mainScreen.frame, v = $.NSScreen.mainScreen.visibleFrame;
+  const sh = f.size.height;
+  const L = v.origin.x, T = sh - (v.origin.y + v.size.height);
+  return [L, T, L + v.size.width, T + v.size.height]
+    .map(x => Math.round(x)).join(" ");
+}')
+
+if [ "$MODE" = "pin" ]; then
+  osascript - "$L" "$T" "$R" "$B" "$DIR/quadfill.js" <<'AS'
+on run argv
+  set L to (item 1 of argv) as integer
+  set R to (item 3 of argv) as integer
+  set js to read (POSIX file (item 5 of argv)) as «class utf8»
+  tell application "Google Chrome"
+    set hits to 0
+    set blocked to 0
+    repeat with w in (get windows)
+      set b to bounds of w
+      if ((item 3 of b) - (item 1 of b)) < 0.6 * (R - L) then
+        try
+          execute active tab of w javascript js
+          set hits to hits + 1
+        on error
+          set blocked to blocked + 1
+        end try
+      end if
+    end repeat
+    if blocked > 0 then
+      return "re-pinned " & hits & " window(s); " & blocked & " blocked — enable Chrome ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events"
+    end if
+    return "re-pinned " & hits & " window(s)"
+  end tell
+end run
+AS
+  exit 0
+fi
+
+# normalize scheme
+ARGS=()
+for u in "$@"; do
+  case "$u" in *://*) ;; *) u="https://$u" ;; esac
+  ARGS+=("$u")
+done
+
+# YouTube video id extraction (bash 3.2-safe: patterns in variables)
+yt_id() {
+  local u="$1"
+  local re_v='[?&]v=([A-Za-z0-9_-]{11})'
+  local re_be='youtu\.be/([A-Za-z0-9_-]{11})'
+  local re_ls='youtube\.com/(live|shorts|embed)/([A-Za-z0-9_-]{11})'
+  if [[ $u =~ $re_v ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  elif [[ $u =~ $re_be ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  elif [[ $u =~ $re_ls ]]; then printf '%s' "${BASH_REMATCH[2]}"
+  fi
+}
+
+ALLYT=1
+IDS=()
+for u in "${ARGS[@]}"; do
+  id=$(yt_id "$u")
+  if [ -n "$id" ]; then IDS+=("$id"); else ALLYT=0; fi
+done
+
+if [ "$ALLYT" = 1 ]; then
+  # ---- quad page mode: one window, N iframe embeds, full-bleed, zero setup
+  if ! curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/quad.html"; then
+    (nohup python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$DIR/web" >/dev/null 2>&1 &)
+    for _ in 1 2 3 4 5 6; do
+      curl -sf -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/quad.html" && break
+      sleep 0.5
+    done
+  fi
+  IDS_CSV=$(IFS=,; printf '%s' "${IDS[*]}")
+  PAGE="http://localhost:$PORT/quad.html?v=$IDS_CSV"
+  OLDIDS=$(osascript -e 'tell application "Google Chrome" to get id of windows' 2>/dev/null | tr -d ' ' || true)
+  open -na "Google Chrome" --args "--app=$PAGE"
+  osascript - "$L" "$T" "$R" "$B" "$OLDIDS" <<'AS'
+on run argv
+  set L to (item 1 of argv) as integer
+  set T to (item 2 of argv) as integer
+  set R to (item 3 of argv) as integer
+  set B to (item 4 of argv) as integer
+  set oldIds to {}
+  set AppleScript's text item delimiters to ","
+  repeat with i in text items of (item 5 of argv)
+    if (i as text) is not "" then copy (i as integer) to end of oldIds
+  end repeat
+  tell application "Google Chrome"
+    activate
+    set win to missing value
+    repeat 40 times
+      repeat with w in (get windows)
+        if (id of w) is not in oldIds and (URL of active tab of w) contains "localhost:8787/quad.html" then
+          set win to w
+          exit repeat
+        end if
+      end repeat
+      if win is not missing value then exit repeat
+      delay 0.5
+    end repeat
+    if win is missing value then return "quad window NOT FOUND"
+    set bounds of win to {L, T, R, B}
+    set b to bounds of win
+    return "quad page -> x=" & (item 1 of b) & " y=" & (item 2 of b) & " " & ((item 3 of b) - (item 1 of b)) & "x" & ((item 4 of b) - (item 2 of b))
+  end tell
+end run
+AS
+  exit 0
+fi
+
+# ---- per-window mode (any site): tiled app windows. Aggregator watch pages
+# are resolved to their direct player iframe URL, which self-fills the window
+# (no pin needed); anything else gets the quadfill pin.
+player_iframe_src() {
+  local html src
+  html=$(curl -sL --max-time 10 -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" "$1" 2>/dev/null || true)
+  [ -n "$html" ] || return 1
+  src=$(printf '%s' "$html" | grep -oE '<iframe[^>]+src="https?://[^"]+"' \
+    | grep -iE 'embed|player|stream|video|cast' \
+    | grep -viE 'doubleclick|googlesyndication|adservice|analytics|facebook|twitter|disqus' \
+    | head -1 | grep -oE 'https?://[^"]+')
+  case "$src" in
+    ""|*/) return 1;;  # placeholder embed (stream not live yet) -> use watch page
+  esac
+  printf '%s' "$src"
+}
+
+OLDIDS=$(osascript -e 'tell application "Google Chrome" to get id of windows' 2>/dev/null | tr -d ' ' || true)
+
+FINAL=()
+FLAGS=()
+for u in "${ARGS[@]}"; do
+  if src=$(player_iframe_src "$u"); then
+    FINAL+=("$src"); FLAGS+=("y")
+  else
+    FINAL+=("$u"); FLAGS+=("n")
+  fi
+done
+FLAGS_CSV=$(IFS=,; printf '%s' "${FLAGS[*]}")
+
+for u in "${FINAL[@]}"; do
+  open -na "Google Chrome" --args "--app=$u"
+  sleep 0.6
+done
+
+osascript - "$L" "$T" "$R" "$B" "$DIR/quadfill.js" "$OLDIDS" "$FLAGS_CSV" "${FINAL[@]}" <<'AS'
+on run argv
+  set L to (item 1 of argv) as integer
+  set T to (item 2 of argv) as integer
+  set R to (item 3 of argv) as integer
+  set B to (item 4 of argv) as integer
+  set js to read (POSIX file (item 5 of argv)) as «class utf8»
+
+  set oldIds to {}
+  set AppleScript's text item delimiters to ","
+  repeat with i in text items of (item 6 of argv)
+    if (i as text) is not "" then copy (i as integer) to end of oldIds
+  end repeat
+
+  set flags to {}
+  set AppleScript's text item delimiters to ","
+  repeat with i in text items of (item 7 of argv)
+    copy (i as text) to end of flags
+  end repeat
+
+  set urls to {}
+  set hosts to {}
+  repeat with i from 8 to count of argv
+    set u to item i of argv
+    copy u to end of urls
+    set AppleScript's text item delimiters to "://"
+    set afterScheme to item 2 of text items of u
+    set AppleScript's text item delimiters to "/"
+    copy (item 1 of text items of afterScheme) to end of hosts
+  end repeat
+  set n to count of urls
+
+  set w2 to (R - L) div 2
+  set h2 to (B - T) div 2
+  set cells to {}
+  if n is 1 then
+    set cells to {{L, T, R, B}}
+  else if n is 2 then
+    set cells to {{L, T, L + w2, B}, {L + w2, T, R, B}}
+  else
+    set allq to {{L, T, L + w2, T + h2}, {L + w2, T, R, T + h2}, {L, T + h2, L + w2, B}, {L + w2, T + h2, R, B}}
+    repeat with i from 1 to n
+      copy (item i of allq) to end of cells
+    end repeat
+  end if
+
+  tell application "Google Chrome"
+    activate
+    set out to ""
+    set placedIds to {}
+    repeat with i from 1 to n
+      set h to item i of hosts
+      set win to missing value
+      repeat 40 times
+        repeat with w in (get windows)
+          if (id of w) is not in oldIds and (id of w) is not in placedIds and (URL of active tab of w) contains h then
+            set win to w
+            exit repeat
+          end if
+        end repeat
+        if win is not missing value then exit repeat
+        delay 0.5
+      end repeat
+      if win is missing value then
+        set out to out & "win" & i & ": NOT FOUND (host " & h & ")" & linefeed
+      else
+        copy (id of win) to end of placedIds
+        set bounds of win to (item i of cells)
+        delay 0.3
+        if item i of flags is "y" then
+          set pinRes to "native"
+        else
+          try
+            set pinRes to execute active tab of win javascript js
+          on error
+            set pinRes to "extension/Apple-Events not enabled — install extension/ (see README) or enable View ▸ Developer ▸ Allow JavaScript from Apple Events"
+          end try
+        end if
+        set b to bounds of win
+        set out to out & "win" & i & ": " & (item i of urls) & " -> x=" & (item 1 of b) & " y=" & (item 2 of b) & " " & ((item 3 of b) - (item 1 of b)) & "x" & ((item 4 of b) - (item 2 of b)) & "  pin=" & pinRes & linefeed
+      end if
+    end repeat
+  end tell
+  return out
+end run
+AS
