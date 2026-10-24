@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>quadbox</title>
+<!--
+  Referer bounce: some player URLs (cricwatch-style sd0embed kits) 403 when
+  loaded without a Referer, and Chrome opened from the CLI sends none.
+  Navigating from this page sends Referer: http://127.0.0.1:8787/, which the
+  player accepts. Target URL arrives base64url-encoded in ?u=.
+-->
+<script>
+  var u = new URLSearchParams(location.search).get("u") || "";
+  u = u.replace(/-/g, "+").replace(/_/g, "/");
+  while (u.length % 4) u += "=";
+  location.replace(atob(u));
+</script>

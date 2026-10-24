@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# quadbox — 1-4 live videos on one screen, each full-bleed in its quadrant.
+# quadbox — 1-4 live videos on one screen, each full-bleed in its own tile.
 #
 #  All-YouTube links -> local quad page (2x2 iframe embeds). No setup at all.
 #  Any other site    -> tiled app-mode windows + quadfill pin, via either:
@@ -12,50 +12,183 @@ PORT=8787
 if [ "${1:-}" = "pin" ]; then
   MODE="pin"
 else
-  # buffstreams picker: quadbox <sport> [team keywords...]
+  # buffstreams picker: quadbox <sport> [more sports / team keywords...]
   #   quadbox nhl            -> numbered menu of today's NHL games, pick up to 4
+  #   quadbox all            -> every game listed today, all sports
+  #   quadbox nfl nba        -> combined cross-sport menu
+  #   quadbox soccer         -> sport groups work too (laliga + mls + ...)
+  #   quadbox cricket        -> today's cricket matches (merged from cricwatch)
   #   quadbox nhl sabres     -> auto-launch every game matching keywords
+  #   quadbox sabres         -> keywords alone search every sport listed today
+  # Args matching a sport on today's page act as sport filters; the rest are
+  # keywords matched against game labels. Only keyword args auto-launch their
+  # matches (when <=4); pure sport filters always show the numbered menu.
   BUFF="${BUFF_DOMAIN:-https://mybuffstreams.plus}"
+  CRIC="${CRIC_DOMAIN:-https://cricwatch.io}"
   re_sport='^[a-z0-9-]+$'
   if [ "$#" -ge 1 ] && [[ $1 =~ $re_sport ]] && ! [[ "$1" == *.* ]]; then
     SPORT="$1"; shift
-    LISTING=$(python3 - "$BUFF" "$SPORT" "$@" <<'PY'
+    LISTING=$(python3 - "$BUFF" "$CRIC" "$SPORT" "$@" <<'PY'
 import re, sys, html as h, urllib.request
-domain, sport, kw = sys.argv[1], sys.argv[2], [w.lower() for w in sys.argv[3:]]
+from concurrent.futures import ThreadPoolExecutor
+domain, cric = sys.argv[1], sys.argv[2]
+args = [a.lower() for a in sys.argv[3:]]
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
+
+def fetch(url):
+    req = urllib.request.Request(url, headers=UA)
+    return urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
+
 try:
-    req = urllib.request.Request(domain + "/", headers={
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"})
-    doc = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
+    doc = fetch(domain + "/")
 except Exception as e:
     sys.exit("fetch failed: %s" % e)
-pat = (r'<a\s+class="competition"\s+title="Buffstreams ([^"]+)"\s+href="('
-       + re.escape(domain) + r'/' + re.escape(sport) + r'/[^"]+)"')
-seen, rows = set(), []
-for m in re.finditer(pat, doc):
-    label, url = h.unescape(m.group(1)).strip(), m.group(2)
-    if url in seen:
-        continue
-    seen.add(url)
-    if kw and not all(w in label.lower() for w in kw):
-        continue
-    rows.append((label, url))
-if not rows:
-    sys.exit("no games found for '%s' today (check sport name; if the site rotated domains, set BUFF_DOMAIN)" % sport)
-for i, (label, url) in enumerate(rows, 1):
-    print("%d\t%s\t%s" % (i, label, url))
-PY
-) || { echo "quadbox: $LISTING" >&2; exit 1; }
 
-    LABELS=(); PICK_URLS=()
+# every game card on a page: <a class="...competition..."> linking to
+# /<sport>/<slug>/... or /title-game/<sport>/<slug>. Label is the
+# title="Buffstreams ..." attribute when present, else the first <div> text
+# (with the "- 01:00 PM ET" time suffix dropped).
+tag_re = re.compile(r'<a\b[^>]*>', re.I)
+cls_re = re.compile(r'class="[^"]*\bcompetition\b[^"]*"', re.I)
+href_re = re.compile(r'href="(' + re.escape(domain) + r'/(?:title-game/)?([a-z0-9-]+)/[^"]*)"')
+title_re = re.compile(r'title="Buffstreams ([^"]+)"')
+time_re = re.compile(r'\s*-\s*\d{1,2}:\d{2}\s*[AP]M\s*ET\s*$', re.I)
+
+def extract(page):
+    out = []
+    for t in tag_re.finditer(page):
+        tag = t.group(0)
+        if not cls_re.search(tag):
+            continue
+        hm = href_re.search(tag)
+        if not hm:
+            continue
+        url, sport = hm.group(1), hm.group(2)
+        if sport == "blog":
+            continue
+        tm = title_re.search(tag)
+        if tm:
+            label = h.unescape(tm.group(1)).strip()
+        else:
+            inner = page[t.end():t.end() + 400]
+            chunk = inner.split('</div>')[0] if '</div>' in inner else inner.split('</a>')[0]
+            label = h.unescape(re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', chunk))).strip()
+            label = time_re.sub('', label).strip(' -')
+        if label:
+            out.append((sport, label, url))
+    return out
+
+# merged game table, first-seen order; aliases group league keys under the
+# landing page they were found on (e.g. laliga+mls under "soccer")
+games, order = {}, []
+def merge(rows, alias=None):
+    for sport, label, url in rows:
+        g = games.get(url)
+        if g is None:
+            g = games[url] = [sport, label, set()]
+            order.append(url)
+        if alias:
+            g[2].add(alias)
+
+merge(extract(doc))
+
+# league landing pages: single-segment links containing "stream"
+# (nflstreams2, soccer-live-streams, ...); some sports list games only there
+land_re = re.compile(r'href="' + re.escape(domain) + r'/([a-z0-9-]*stream[a-z0-9-]*)"')
+suffix_re = re.compile(r'(-live-streams|streams2?|streams)$')
+slugs, seen_slugs = [], set()
+for m in land_re.finditer(doc):
+    slug = m.group(1)
+    alias = suffix_re.sub('', slug)
+    if alias and slug not in seen_slugs:
+        seen_slugs.add(slug)
+        slugs.append((slug, alias))
+
+# cricket comes from cricwatch's listing (buffstreams has no cricket section):
+# match cards are two-segment links ending in -stream, label in the <h2>
+cric_re = re.compile(r'<a\s+href="(/[a-z0-9-]+/[a-z0-9-]+-stream)"[^>]*>(.*?)</a>', re.S)
+h2_re = re.compile(r'<h2[^>]*>([^<]+)</h2>')
+def extract_cric(page):
+    out = []
+    for m in cric_re.finditer(page):
+        hm = h2_re.search(m.group(2))
+        if hm:
+            out.append(("cricket", h.unescape(hm.group(1)).strip(), cric + m.group(1)))
+    return out
+
+tasks = [(alias, "%s/%s" % (domain, slug), extract) for slug, alias in slugs]
+tasks.append((None, cric + "/all-matches-streams", extract_cric))
+
+def fetch_landing(item):
+    alias, url, ex = item
+    try:
+        return alias, ex(fetch(url))
+    except Exception:
+        return alias, []
+
+with ThreadPoolExecutor(max_workers=8) as ex:
+    for alias, rows in ex.map(fetch_landing, tasks):
+        merge(rows, alias)
+
+avail_sports, avail_aliases = [], []
+for url in order:
+    s, _, al = games[url]
+    if s not in avail_sports:
+        avail_sports.append(s)
+    for a in al:
+        if a not in avail_aliases:
+            avail_aliases.append(a)
+
+sports, aliases, kw = [], [], []
+for a in args:
+    if a == "all":
+        sports.extend(avail_sports)   # "all" = every sport listed today
+    elif a in avail_sports:
+        sports.append(a)
+    elif a in avail_aliases:
+        aliases.append(a)
+    else:
+        kw.append(a)
+
+rows = []
+for url in order:
+    s, label, al = games[url]
+    if (sports or aliases) and not (s in sports or al & set(aliases)):
+        continue
+    if all(w in label.lower() for w in kw):
+        rows.append((s, label, url))
+
+if not rows:
+    live = avail_sports + [a for a in avail_aliases if a not in avail_sports]
+    shown = " ".join(a for a in args if a != "all") or "all"
+    sys.exit("no games found today matching '%s' (live today: %s — check sport/team names; if the site rotated domains, set BUFF_DOMAIN)"
+             % (shown, ", ".join(live) or "none"))
+mixed = len({s for s, _, _ in rows}) > 1
+for i, (s, label, url) in enumerate(rows, 1):
+    if mixed:
+        label = "[%s] %s" % (s, label)
+    print("%d\t%s\t%s" % (i, label, url))
+# keyword searches auto-launch their matches; sport filters always menu
+print("MODE\t%s" % ("auto" if kw else "menu"))
+PY
+) || { [ -z "$LISTING" ] || echo "quadbox: $LISTING" >&2; exit 1; }
+
+    LABELS=(); PICK_URLS=(); MODE=menu
     while IFS=$'\t' read -r _idx label url; do
+      case "$_idx" in MODE) MODE="$label"; continue;; esac
       LABELS+=("$label"); PICK_URLS+=("$url")
     done <<< "$LISTING"
 
-    if [ "$#" -gt 0 ] && [ "${#PICK_URLS[@]}" -le 4 ]; then
+    # team keywords auto-launch their matches; sport filters always show the
+    # menu, so `quadbox nfl nba` lists the combined slate instead of just
+    # filling the quad with whatever fit
+    if [ "$MODE" = "auto" ] && [ "${#PICK_URLS[@]}" -le 4 ]; then
       PICKED=("${PICK_URLS[@]}")            # keyword mode: auto-pick matches
       PICKED_LABELS=("${LABELS[@]}")
     else
-      echo "$LISTING" | cut -f1,2 >&2      # numbered menu
+      for _i in "${!LABELS[@]}"; do          # numbered menu
+        printf '%s\t%s\n' "$((_i + 1))" "${LABELS[$_i]}" >&2
+      done
       printf 'pick up to 4 numbers (space separated): ' >&2
       IFS=' ' read -r picks
       PICKED=(); PICKED_LABELS=()
@@ -94,15 +227,43 @@ PY
 fi
 
 # Visible work area (excludes menu bar + Dock), converted to top-left coords.
-read -r L T R B < <(osascript -l JavaScript -e '
-function run() {
+# Target screen: the first external display when one is connected — the quad
+# lands there (ready to mirror to a TV/projector) and the laptop stays free.
+# QUAD_MAIN=1 forces the built-in screen. Screen frames live in one global
+# bottom-left-origin space; screens[0] is the primary display (origin 0,0 by
+# definition), so its height is the y-flip reference into AppleScript's
+# top-left bounds coordinates — required once the target isn't the primary.
+SCRARG="auto"; [ -n "${QUAD_MAIN:-}" ] && SCRARG="main"
+read -r L T R B SCREEN SCR_DIM < <(osascript -l JavaScript -e '
+function run(argv) {
   ObjC.import("AppKit");
-  const f = $.NSScreen.mainScreen.frame, v = $.NSScreen.mainScreen.visibleFrame;
-  const sh = f.size.height;
-  const L = v.origin.x, T = sh - (v.origin.y + v.size.height);
+  ObjC.import("Quartz");
+  const screens = $.NSScreen.screens;
+  const primary = screens.objectAtIndex(0);
+  const ph = primary.frame.size.height;
+  let s = primary, label = "main";
+  if (argv[0] !== "main") {
+    for (let i = 0; i < screens.count; i++) {
+      const sc = screens.objectAtIndex(i);
+      let builtin = i === 0;   // fallback if CoreGraphics is unreachable
+      try {
+        builtin = $.CGDisplayIsBuiltin(
+          sc.deviceDescription.objectForKey("NSScreenNumber").unsignedIntValue);
+      } catch (e) {}
+      if (!builtin) { s = sc; label = "external"; break; }
+    }
+  }
+  const v = s.visibleFrame;
+  const L = v.origin.x, T = ph - (v.origin.y + v.size.height);
   return [L, T, L + v.size.width, T + v.size.height]
-    .map(x => Math.round(x)).join(" ");
-}')
+    .map(x => Math.round(x)).join(" ")
+    + " " + label + " " + Math.round(s.frame.size.width) + "x" + Math.round(s.frame.size.height);
+}' "$SCRARG")
+if [ "$SCREEN" = external ]; then
+  echo "quadbox: tiling on external display $SCR_DIM — laptop stays free (QUAD_MAIN=1 forces the laptop screen)" >&2
+elif [ "$SCRARG" = main ]; then
+  echo "quadbox: QUAD_MAIN set — tiling on the built-in screen $SCR_DIM" >&2
+fi
 
 if [ "$MODE" = "pin" ]; then
   osascript - "$L" "$T" "$R" "$B" "$DIR/quadfill.js" <<'AS'
@@ -160,8 +321,7 @@ for u in "${ARGS[@]}"; do
   if [ -n "$id" ]; then IDS+=("$id"); else ALLYT=0; fi
 done
 
-if [ "$ALLYT" = 1 ]; then
-  # ---- quad page mode: one window, N iframe embeds, full-bleed, zero setup
+ensure_server() {
   if ! curl -sf -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/quad.html"; then
     (nohup python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$DIR/web" >/dev/null 2>&1 &)
     for _ in 1 2 3 4 5 6; do
@@ -169,6 +329,11 @@ if [ "$ALLYT" = 1 ]; then
       sleep 0.5
     done
   fi
+}
+
+if [ "$ALLYT" = 1 ]; then
+  # ---- quad page mode: one window, N iframe embeds, full-bleed, zero setup
+  ensure_server
   IDS_CSV=$(IFS=,; printf '%s' "${IDS[*]}")
   PAGE="http://localhost:$PORT/quad.html?v=$IDS_CSV"
   OLDIDS=$(osascript -e 'tell application "Google Chrome" to get id of windows' 2>/dev/null | tr -d ' ' || true)
@@ -198,11 +363,72 @@ on run argv
       delay 0.5
     end repeat
     if win is missing value then return "quad window NOT FOUND"
-    set bounds of win to {L, T, R, B}
-    set b to bounds of win
-    return "quad page -> x=" & (item 1 of b) & " y=" & (item 2 of b) & " " & ((item 3 of b) - (item 1 of b)) & "x" & ((item 4 of b) - (item 2 of b))
+    set winId to id of win
+    my moveToCell(winId, {L, T, R, B}, {L, T, R, B})
+    -- hide the title bar via AX (Chrome clamps its own "set bounds"); needs
+    -- Accessibility permission for the terminal, else the frame stays put
+    try
+      tell application "System Events"
+        tell process "Google Chrome"
+          repeat with aw in (get windows)
+            set p to value of attribute "AXPosition" of aw
+            set s to value of attribute "AXSize" of aw
+            if (item 1 of p) ≥ L - 1 and (item 1 of p) ≤ L + 1 and (item 2 of p) ≥ T - 1 and (item 2 of p) ≤ T + 1 and (item 1 of s) ≥ (R - L) - 1 and (item 1 of s) ≤ (R - L) + 1 and (item 2 of s) ≥ (B - T) - 1 and (item 2 of s) ≤ (B - T) + 1 then
+              set value of attribute "AXSize" of aw to {R - L, B - T + 28}
+              set value of attribute "AXPosition" of aw to {L, T - 28}
+            end if
+          end repeat
+        end tell
+      end tell
+    end try
+    set rdb to bounds of (window id winId)
+    set hint to ""
+    if (item 2 of rdb) > (T - 27) then set hint to "  (title bar visible — grant Accessibility to your terminal to hide it)"
+    return "quad page -> x=" & (item 1 of rdb) & " y=" & (item 2 of rdb) & " " & ((item 3 of rdb) - (item 1 of rdb)) & "x" & ((item 4 of rdb) - (item 2 of rdb)) & hint
   end tell
 end run
+
+-- Move a window (by ID) to an absolute cell, across screens if needed.
+-- macOS slides a window back onto its current screen when the new frame does
+-- not touch that screen, and re-homes it to the screen holding most of its
+-- frame. So: same screen -> set the cell directly; otherwise straddle the
+-- boundary (~55% of the frame on the target side, still touching the current
+-- screen), let the window re-home, then set the exact cell (a same-screen
+-- set). The window is re-resolved by ID at every step because moving it
+-- reorders Chrome's window list, making positional references stale. Note
+-- AppleScript names are case-insensitive: a stray "set b to ..." anywhere
+-- would clobber the screen coordinate B (observed as -1700 coercion errors)
+-- — the readback variable is named rdb for that reason.
+on moveToCell(winId, c, scr)
+  tell application "Google Chrome"
+    set cb to bounds of (window id winId)
+    if (class of cb is not list) or ((count of cb) is not 4) then return
+    try
+      set ccx to ((item 1 of cb) + (item 3 of cb)) div 2
+      set ccy to ((item 2 of cb) + (item 4 of cb)) div 2
+    on error
+      return -- malformed bounds read; leave the window where it is
+    end try
+    set scrL to item 1 of scr
+    set scrT to item 2 of scr
+    set scrR to item 3 of scr
+    set scrB to item 4 of scr
+    if ccx ≥ scrL and ccx < scrR and ccy ≥ scrT and ccy < scrB then
+      set bounds of (window id winId) to c
+      return
+    end if
+    set cw to (item 3 of cb) - (item 1 of cb)
+    set ch to (item 4 of cb) - (item 2 of cb)
+    set nx to item 1 of cb
+    set ny to item 2 of cb
+    if ccx < scrL then set nx to scrL - ((cw * 45) div 100)
+    if ccx ≥ scrR then set nx to scrR - ((cw * 55) div 100)
+    if ccy < scrT then set ny to scrT - ((ch * 45) div 100)
+    if ccy ≥ scrB then set ny to scrB - ((ch * 55) div 100)
+    set bounds of (window id winId) to {nx, ny, nx + cw, ny + ch}
+    set bounds of (window id winId) to c
+  end tell
+end moveToCell
 AS
   exit 0
 fi
@@ -211,15 +437,43 @@ fi
 # are resolved to their direct player iframe URL, which self-fills the window
 # (no pin needed); anything else gets the quadfill pin.
 player_iframe_src() {
-  local html src
-  html=$(curl -sL --max-time 10 -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" "$1" 2>/dev/null || true)
+  local html src UA
+  UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+  html=$(curl -sL --max-time 10 -A "$UA" "$1" 2>/dev/null || true)
   [ -n "$html" ] || return 1
   src=$(printf '%s' "$html" | grep -oE '<iframe[^>]+src="https?://[^"]+"' \
     | grep -iE 'embed|player|stream|video|cast' \
     | grep -viE 'doubleclick|googlesyndication|adservice|analytics|facebook|twitter|disqus' \
     | head -1 | grep -oE 'https?://[^"]+')
   case "$src" in
-    ""|*/) return 1;;  # placeholder embed (stream not live yet) -> use watch page
+    ""|*/)
+      # no static iframe (placeholder or JS-injected player). Try the
+      # cricwatch-style embed kit: <script embed.min.js data-pldm/pid/play>
+      # + siteConfig JSON -> signed https://<pldm>/sd0embed/<gc>?... player
+      # URL. Signatures expire ~60s after the page fetch and the player 403s
+      # without a Referer, so validate now and mark it for the referer bounce.
+      src=$(printf '%s' "$html" | python3 -c '
+import re, sys, urllib.parse
+doc = sys.stdin.read()
+def cfg(k):
+    m = re.search(r"\"%s\":\"([^\"]+)\"" % k, doc)
+    return m.group(1) if m else None
+def sattr(k):
+    m = re.search(r"<script[^>]*embed\.min\.js[^>]*data-%s=\"([^\"]+)\"" % k, doc)
+    return m.group(1) if m else None
+pldm, pid, play = sattr("pldm"), sattr("pid"), sattr("play")
+csrf, csrf_ip, exp, sech = cfg("csrf"), cfg("csrf_ip"), cfg("sec_expires"), cfg("sec_hash")
+if not all((pldm, pid, play, csrf, csrf_ip, exp, sech)):
+    sys.exit(1)
+q = urllib.parse.urlencode({"pid": pid, "v": play, "player": sattr("player") or "jw",
+    "csrf": csrf, "csrf_ip": csrf_ip, "expires": exp, "sec_hash": sech})
+print("https://%s/sd0embed/%s?%s" % (pldm, sattr("gc") or "sports", q))
+' 2>/dev/null || true)
+      [ -n "$src" ] || return 1
+      curl -sf -o /dev/null --max-time 10 -A "$UA" -e "$1" "$src" || return 1
+      printf '%s\tref' "$src"
+      return 0
+      ;;
   esac
   printf '%s' "$src"
 }
@@ -227,17 +481,31 @@ player_iframe_src() {
 OLDIDS=$(osascript -e 'tell application "Google Chrome" to get id of windows' 2>/dev/null | tr -d ' ' || true)
 
 FINAL=()
+OPENURLS=()
 FLAGS=()
+NEEDSRV=0
 for u in "${ARGS[@]}"; do
-  if src=$(player_iframe_src "$u"); then
+  if out=$(player_iframe_src "$u"); then
+    src="${out%%$'\t'*}"
+    case "$out" in
+      *$'\t'ref)
+        # player 403s without a Referer; bounce through a localhost page so
+        # Chrome sends one (see web/go.html)
+        b64=$(printf '%s' "$src" | base64 | tr '+/' '-_' | tr -d '=\n')
+        OPENURLS+=("http://127.0.0.1:$PORT/go.html?u=$b64")
+        NEEDSRV=1
+        ;;
+      *) OPENURLS+=("$src");;
+    esac
     FINAL+=("$src"); FLAGS+=("y")
   else
-    FINAL+=("$u"); FLAGS+=("n")
+    FINAL+=("$u"); OPENURLS+=("$u"); FLAGS+=("n")
   fi
 done
 FLAGS_CSV=$(IFS=,; printf '%s' "${FLAGS[*]}")
+[ "$NEEDSRV" = 1 ] && ensure_server
 
-for u in "${FINAL[@]}"; do
+for u in "${OPENURLS[@]}"; do
   open -na "Google Chrome" --args "--app=$u"
   sleep 0.6
 done
@@ -276,13 +544,21 @@ on run argv
 
   set w2 to (R - L) div 2
   set h2 to (B - T) div 2
+  -- seam overlap: windows behind slide `g` px under their front neighbor, so
+  -- the shared edge shows a thin window shadow over video instead of a black
+  -- gap. Raise order is win1..win4 front-to-back (raised in reverse), so the
+  -- bottom row underlaps the top row and the right column underlaps the left.
+  set g to 16
   set cells to {}
   if n is 1 then
     set cells to {{L, T, R, B}}
   else if n is 2 then
-    set cells to {{L, T, L + w2, B}, {L + w2, T, R, B}}
+    set cells to {{L, T, R, T + h2}, {L, T + h2 - g, R, B}}
+  else if n is 3 then
+    -- two side-by-side on top, one full-width underneath (3 cross-sport games)
+    set cells to {{L, T, L + w2, T + h2}, {L + w2 - g, T, R, T + h2}, {L, T + h2 - g, R, B}}
   else
-    set allq to {{L, T, L + w2, T + h2}, {L + w2, T, R, T + h2}, {L, T + h2, L + w2, B}, {L + w2, T + h2, R, B}}
+    set allq to {{L, T, L + w2, T + h2}, {L + w2 - g, T, R, T + h2}, {L, T + h2 - g, L + w2, B}, {L + w2 - g, T + h2 - g, R, B}}
     repeat with i from 1 to n
       copy (item i of allq) to end of cells
     end repeat
@@ -292,6 +568,7 @@ on run argv
     activate
     set out to ""
     set placedIds to {}
+    set needAxHint to false
     repeat with i from 1 to n
       set h to item i of hosts
       set win to missing value
@@ -308,23 +585,100 @@ on run argv
       if win is missing value then
         set out to out & "win" & i & ": NOT FOUND (host " & h & ")" & linefeed
       else
-        copy (id of win) to end of placedIds
-        set bounds of win to (item i of cells)
+        set winId to id of win
+        copy winId to end of placedIds
+        set c to item i of cells
+        my moveToCell(winId, c, {L, T, R, B})
+        -- hide the title bar: grow the frame 28px above the cell so the bar
+        -- tucks under the menu bar / behind the row above. Chrome clamps
+        -- its own "set bounds", so this goes through AX — needs Accessibility
+        -- permission for the terminal; without it the cell stands as-is.
+        set cx to item 1 of c
+        set cy to item 2 of c
+        set cw to (item 3 of c) - cx
+        set ch to (item 4 of c) - cy
+        try
+          tell application "System Events"
+            tell process "Google Chrome"
+              repeat with aw in (get windows)
+                set p to value of attribute "AXPosition" of aw
+                set s to value of attribute "AXSize" of aw
+                if (item 1 of p) ≥ cx - 1 and (item 1 of p) ≤ cx + 1 and (item 2 of p) ≥ cy - 1 and (item 2 of p) ≤ cy + 1 and (item 1 of s) ≥ cw - 1 and (item 1 of s) ≤ cw + 1 and (item 2 of s) ≥ ch - 1 and (item 2 of s) ≤ ch + 1 then
+                  set value of attribute "AXSize" of aw to {cw, ch + 28}
+                  set value of attribute "AXPosition" of aw to {cx, cy - 28}
+                end if
+              end repeat
+            end tell
+          end tell
+        end try
         delay 0.3
         if item i of flags is "y" then
           set pinRes to "native"
         else
           try
-            set pinRes to execute active tab of win javascript js
+            set pinRes to execute active tab of (window id winId) javascript js
           on error
             set pinRes to "extension/Apple-Events not enabled — install extension/ (see README) or enable View ▸ Developer ▸ Allow JavaScript from Apple Events"
           end try
         end if
-        set b to bounds of win
-        set out to out & "win" & i & ": " & (item i of urls) & " -> x=" & (item 1 of b) & " y=" & (item 2 of b) & " " & ((item 3 of b) - (item 1 of b)) & "x" & ((item 4 of b) - (item 2 of b)) & "  pin=" & pinRes & linefeed
+        set rdb to bounds of (window id winId)
+        if (item 2 of rdb) > (cy - 27) then set needAxHint to true
+        set out to out & "win" & i & ": " & (item i of urls) & " -> x=" & (item 1 of rdb) & " y=" & (item 2 of rdb) & " " & ((item 3 of rdb) - (item 1 of rdb)) & "x" & ((item 4 of rdb) - (item 2 of rdb)) & "  pin=" & pinRes & linefeed
       end if
     end repeat
+    -- borderless frames overlap the row above by the hidden bar's height;
+    -- raise top rows last so their content covers lower windows' bars
+    repeat with i from (count of placedIds) to 1 by -1
+      try
+        set index of (window id (item i of placedIds)) to 1
+      end try
+    end repeat
+    if needAxHint then
+      set out to out & "title bars visible — grant Accessibility to your terminal (System Settings ▸ Privacy & Security ▸ Accessibility) to hide them" & linefeed
+    end if
   end tell
   return out
 end run
+
+-- Move a window (by ID) to an absolute cell, across screens if needed.
+-- macOS slides a window back onto its current screen when the new frame does
+-- not touch that screen, and re-homes it to the screen holding most of its
+-- frame. So: same screen -> set the cell directly; otherwise straddle the
+-- boundary (~55% of the frame on the target side, still touching the current
+-- screen), let the window re-home, then set the exact cell (a same-screen
+-- set). The window is re-resolved by ID at every step because moving it
+-- reorders Chrome's window list, making positional references stale. Note
+-- AppleScript names are case-insensitive: a stray "set b to ..." anywhere
+-- would clobber the screen coordinate B (observed as -1700 coercion errors)
+-- — the readback variable is named rdb for that reason.
+on moveToCell(winId, c, scr)
+  tell application "Google Chrome"
+    set cb to bounds of (window id winId)
+    if (class of cb is not list) or ((count of cb) is not 4) then return
+    try
+      set ccx to ((item 1 of cb) + (item 3 of cb)) div 2
+      set ccy to ((item 2 of cb) + (item 4 of cb)) div 2
+    on error
+      return -- malformed bounds read; leave the window where it is
+    end try
+    set scrL to item 1 of scr
+    set scrT to item 2 of scr
+    set scrR to item 3 of scr
+    set scrB to item 4 of scr
+    if ccx ≥ scrL and ccx < scrR and ccy ≥ scrT and ccy < scrB then
+      set bounds of (window id winId) to c
+      return
+    end if
+    set cw to (item 3 of cb) - (item 1 of cb)
+    set ch to (item 4 of cb) - (item 2 of cb)
+    set nx to item 1 of cb
+    set ny to item 2 of cb
+    if ccx < scrL then set nx to scrL - ((cw * 45) div 100)
+    if ccx ≥ scrR then set nx to scrR - ((cw * 55) div 100)
+    if ccy < scrT then set ny to scrT - ((ch * 45) div 100)
+    if ccy ≥ scrB then set ny to scrB - ((ch * 55) div 100)
+    set bounds of (window id winId) to {nx, ny, nx + cw, ny + ch}
+    set bounds of (window id winId) to c
+  end tell
+end moveToCell
 AS
