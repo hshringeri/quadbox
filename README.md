@@ -9,61 +9,17 @@ all-or-nothing), and streaming sites can't be embedded in a custom app
 Chrome windows into a grid and stretches each video player to fill its
 window.
 
-## Quickstart — 4 games in 60 seconds
+## Quickstart — league name, pick numbers, done
 
 ```sh
 git clone https://github.com/hshringeri/quadbox.git
 cd quadbox
-./quadbox
+./quadbox nhl          # or nfl, cfb, nba, soccer, cricket, all, ...
 ```
 
-Paste up to 4 game links, one per line, hit Enter — done. Or pass them
-directly:
-
-```sh
-./quadbox <url1> <url2> <url3> <url4>
-```
-
-Then click play in each window once, and mute the three you're not listening
-to (player volume buttons).
-
-What you get depends on the source — quadbox picks the best engine
-automatically:
-
-| Source | What happens | Setup |
-|---|---|---|
-| YouTube (all 4 links) | One window, built-in 2×2 embed grid, auto-playing muted | none |
-| Aggregator watch pages (buffstreams/streameast-style) | Each page's player is resolved to its direct URL, which fills its window natively | none |
-| NFL+, ESPN, Prime, Peacock, … | Tiled app-mode windows; video pinned full-bleed | one-time, below |
-
-## Buffstreams picker (no link-hunting)
-
-```sh
-./quadbox all                # everything listed today, all sports
-./quadbox nhl                # numbered menu of today's NHL games — pick up to 4
-./quadbox nhl sabres         # auto-launch every game matching keywords
-./quadbox nfl chiefs eagles  # multiple words narrow the match
-./quadbox nfl nhl            # cross-sport: one combined menu, pick up to 4
-./quadbox soccer             # groups work too: every soccer league at once
-./quadbox cricket            # today's cricket matches (merged from cricwatch.io)
-./quadbox sabres             # no sport given: search every sport listed today
-```
-
-Mix sports freely — any argument matching a sport on today's page filters by
-sport, the rest are keywords matched against game labels. Cross-sport listings
-tag each row with `[sport]`. Sport filters always show the menu, so
-`./quadbox nfl nba` lists today's combined slate and waits for your picks;
-team keywords instead launch their matches directly when ≤4 of them match.
-
-Soccer and a few other sports list games only on their league pages — the
-picker merges those in automatically. Cricket comes from a second site
-(cricwatch.io's match list, `CRIC_DOMAIN` override if it rotates) since the
-main site has no cricket section. That makes keys granular (`laliga`,
-`mls`, `premier-league`) with the group name (`soccer`) matching them all;
-same for `mlb`/`nba` style shortcuts over hyphenated league keys. The merge
-fetches the league pages in parallel, so the picker takes ~3 s.
-
-### Example: 4 games, zero link-hunting
+A numbered menu of today's games appears. Type up to 4 numbers, hit Enter —
+four tiled windows, each with a full-bleed player. Click play once per
+window, mute the three you're not listening to (player volume buttons).
 
 ```console
 $ ./quadbox nhl
@@ -91,8 +47,34 @@ win3: -> x=0   y=510 735x472  pin=native
 win4: -> x=735 y=510 736x472  pin=native
 ```
 
-Four windows, 2×2, each with its full-bleed player. Click play once per
-window, mute three.
+## Picking games
+
+Games are pulled from a buffstreams-style listing — no link-hunting:
+
+```sh
+./quadbox all                # everything listed today, all sports
+./quadbox nhl                # numbered menu of today's NHL games — pick up to 4
+./quadbox nhl sabres         # auto-launch every game matching keywords
+./quadbox nfl chiefs eagles  # multiple words narrow the match
+./quadbox nfl nhl            # cross-sport: one combined menu, pick up to 4
+./quadbox soccer             # groups work too: every soccer league at once
+./quadbox cricket            # today's cricket matches (merged from cricwatch.io)
+./quadbox sabres             # no sport given: search every sport listed today
+```
+
+Mix sports freely — any argument matching a sport on today's page filters by
+sport, the rest are keywords matched against game labels. Cross-sport listings
+tag each row with `[sport]`. Sport filters always show the menu, so
+`./quadbox nfl nba` lists today's combined slate and waits for your picks;
+team keywords instead launch their matches directly when ≤4 of them match.
+
+Soccer and a few other sports list games only on their league pages — the
+picker merges those in automatically. Cricket comes from a second site
+(cricwatch.io's match list, `CRIC_DOMAIN` override if it rotates) since the
+main site has no cricket section. That makes keys granular (`laliga`,
+`mls`, `premier-league`) with the group name (`soccer`) matching them all;
+same for `mlb`/`nba` style shortcuts over hyphenated league keys. The merge
+fetches the league pages in parallel, so the picker takes ~3 s.
 
 Only know team names? Skip the menu — keywords match the listing and launch
 directly (great for a single game: `./quadbox nhl sabres`, or just
@@ -105,6 +87,24 @@ what's actually live. Pre-game you get the watch page
 (it goes live there); once live, the command resolves straight to the
 full-bleed player. If the site rotates domains:
 `BUFF_DOMAIN=https://<new-domain> ./quadbox nhl`
+
+## Paste links instead
+
+No args, and quadbox asks for links — paste up to 4, one per line, hit
+Enter. Or pass them directly:
+
+```sh
+./quadbox <url1> <url2> <url3> <url4>
+```
+
+What you get depends on the source — quadbox picks the best engine
+automatically:
+
+| Source | What happens | Setup |
+|---|---|---|
+| YouTube (all 4 links) | One window, built-in 2×2 embed grid, auto-playing muted | none |
+| Aggregator watch pages (buffstreams/streameast-style) | Each page's player is resolved to its direct URL, which fills its window natively | none |
+| NFL+, ESPN, Prime, Peacock, … | Tiled app-mode windows; video pinned full-bleed | one-time, below |
 
 ## One-time setup for full-bleed on any site
 
